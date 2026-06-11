@@ -1,6 +1,6 @@
 [package]
 name = "quaver"
-version = "1.0.0"
+version = "1.0.3"
 description = "A lightweight local music player"
 authors = ["Niall"]
 edition = "2021"
@@ -27,9 +27,9 @@ symphonia = { version = "0.5.4", features = ["all"] }
 walkdir = "2.5"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json"] }
-base64 = "0.22"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-single-instance = "2"
 chromaprint-next = "0.1.0"
 tokio = { version = "1.52.3", features = ["rt", "time"] }
 

@@ -14,6 +14,7 @@ dist-ssr
 
 # Local assistant/browser attachments
 .codex-remote-attachments/
+.claude/
 
 # Build and release artifacts belong on GitHub Releases, not in source control
 android-apk/

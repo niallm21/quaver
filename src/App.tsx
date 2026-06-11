@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useWavesurfer } from "@wavesurfer/react";
 import { Vibrant } from 'node-vibrant/browser';
 import { open } from "@tauri-apps/plugin-dialog";
-import { Minimize2, X, Play, Pause, SkipBack, SkipForward, Search, FolderPlus, Volume2, VolumeX, MoreVertical, Music, PanelLeftClose, PanelLeftOpen, Shuffle, Repeat, Repeat1, ListMusic, Library, Disc3, Folder, Plus, ChevronLeft, Trash2, Wand2 } from "lucide-react";
+import { Minimize2, X, Play, Pause, SkipBack, SkipForward, Search, FolderPlus, Volume2, VolumeX, MoreVertical, Music, PanelLeftClose, PanelLeftOpen, Shuffle, Repeat, Repeat1, ListMusic, ListPlus, Library, Disc3, Folder, Plus, ChevronLeft, ChevronUp, ChevronDown, Pencil, Check, Trash2, Wand2 } from "lucide-react";
 import "./App.css";
 
 const COLLAPSED_WINDOW_MIN_WIDTH = 390;
@@ -36,6 +36,11 @@ type PlaylistSummary = {
 type BrowseMode = "songs" | "albums" | "folders" | "playlists";
 type SortMode = "artist" | "album" | "title";
 type VisualizerMode = "lavalamp" | "aurora" | "pulse";
+type ImportNotice = {
+  id: number;
+  title: string;
+  detail: string;
+};
 
 const VISUALIZER_MODES: VisualizerMode[] = ["lavalamp", "aurora", "pulse"];
 
@@ -59,9 +64,15 @@ const applyPaletteFromUrl = (url: string, shouldApply: () => boolean = () => tru
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const createArtObjectUrl = (artBytes: unknown) => {
-  if (!Array.isArray(artBytes) || artBytes.length === 0) return null;
-  const blob = new Blob([new Uint8Array(artBytes as number[])]);
-  return URL.createObjectURL(blob);
+  // Art commands return raw bytes (ArrayBuffer); an empty body means "no art".
+  if (artBytes instanceof ArrayBuffer) {
+    if (artBytes.byteLength === 0) return null;
+    return URL.createObjectURL(new Blob([artBytes]));
+  }
+  if (Array.isArray(artBytes) && artBytes.length > 0) {
+    return URL.createObjectURL(new Blob([new Uint8Array(artBytes as number[])]));
+  }
+  return null;
 };
 
 const getTrackName = (track: Track) => (
@@ -160,7 +171,10 @@ function BackgroundVisualizer({ mode }: { mode: VisualizerMode }) {
 }
 
 function App() {
-  const [visualizer, setVisualizer] = useState<VisualizerMode>("lavalamp");
+  const [visualizer, setVisualizer] = useState<VisualizerMode>(() => {
+    const saved = localStorage.getItem("quaver_visualizer");
+    return VISUALIZER_MODES.includes(saved as VisualizerMode) ? (saved as VisualizerMode) : "lavalamp";
+  });
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [folders, setFolders] = useState<FolderSummary[]>([]);
@@ -182,8 +196,28 @@ function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [showScroll, setShowScroll] = useState(false);
-  const [shuffleEnabled, setShuffleEnabled] = useState(false);
-  const [repeatMode, setRepeatMode] = useState<"off" | "all" | "one">("off");
+  const [shuffleEnabled, setShuffleEnabled] = useState(() => localStorage.getItem("quaver_shuffle") === "1");
+  const [repeatMode, setRepeatMode] = useState<"off" | "all" | "one">(() => {
+    const saved = localStorage.getItem("quaver_repeat");
+    return saved === "all" || saved === "one" ? saved : "off";
+  });
+  // The play queue is snapshotted when a track is started from a view, so searching
+  // or browsing elsewhere doesn't change what plays next.
+  const [queue, setQueue] = useState<Track[]>([]);
+
+  // "Add to playlist" picker: which track it's for and where to anchor it
+  const [pickerTrack, setPickerTrack] = useState<Track | null>(null);
+  const [pickerPos, setPickerPos] = useState<{ x: number; y: number } | null>(null);
+  const [pickerCreating, setPickerCreating] = useState(false);
+  const [pickerNewName, setPickerNewName] = useState("");
+  const [renamingPlaylistId, setRenamingPlaylistId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [confirmingDeletePlaylistId, setConfirmingDeletePlaylistId] = useState<number | null>(null);
+  const [importNotice, setImportNotice] = useState<ImportNotice | null>(null);
+
+  useEffect(() => { localStorage.setItem("quaver_visualizer", visualizer); }, [visualizer]);
+  useEffect(() => { localStorage.setItem("quaver_shuffle", shuffleEnabled ? "1" : "0"); }, [shuffleEnabled]);
+  useEffect(() => { localStorage.setItem("quaver_repeat", repeatMode); }, [repeatMode]);
 
   const handleRescan = async () => {
     if (!isTauri) return;
@@ -193,6 +227,7 @@ function App() {
       const updated = await invoke<Track[]>("rescan_library");
       const nextTracks = dedupeTracks(updated);
       setTracks(nextTracks);
+      setQueue(prev => prev.filter(track => nextTracks.some(next => next.file_path === track.file_path)));
       if (currentTrack && !nextTracks.some(track => track.file_path === currentTrack.file_path)) {
         playbackRequestRef.current += 1;
         setCurrentTrack(null);
@@ -220,6 +255,7 @@ function App() {
     setSelectedPlaylistId(null);
     setBrowseMode("songs");
     playbackRequestRef.current += 1;
+    setQueue([]);
     setCurrentTrack(null);
     setCurrentTime(0);
     setCurrentArtUrl(null);
@@ -257,6 +293,7 @@ function App() {
   const requestedTrackArtRef = useRef<Set<string>>(new Set());
   const fallbackArtUrlsRef = useRef<Record<string, string | null>>({});
   const fallbackArtPromisesRef = useRef<Record<string, Promise<string | null>>>({});
+  const importNoticeTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const trackArtVersionRef = useRef(0);
   const thumbnailsMountedRef = useRef(true);
   const expandedWindowWidthRef = useRef<number | null>(null);
@@ -553,6 +590,53 @@ function App() {
     }
   };
 
+  const showImportNotice = useCallback((imported: Track[]) => {
+    if (imported.length === 0) return;
+    if (importNoticeTimerRef.current) window.clearTimeout(importNoticeTimerRef.current);
+    const firstTrack = getTrackName(imported[0]);
+    setImportNotice({
+      id: Date.now(),
+      title: imported.length === 1 ? "Added to Quaver" : `${imported.length} songs added`,
+      detail: imported.length === 1 ? firstTrack : `${firstTrack} and ${imported.length - 1} more`,
+    });
+    importNoticeTimerRef.current = window.setTimeout(() => {
+      setImportNotice(null);
+      importNoticeTimerRef.current = null;
+    }, 3400);
+  }, []);
+
+  useEffect(() => () => {
+    if (importNoticeTimerRef.current) window.clearTimeout(importNoticeTimerRef.current);
+  }, []);
+
+  // Files opened from the OS (double-click in Explorer / "Open with"): import
+  // them into the library, queue them, and start playing the first one.
+  const importAndPlayFiles = useCallback(async (paths: string[]) => {
+    if (!isTauri || paths.length === 0) return;
+    try {
+      const imported = await invoke<Track[]>("import_files", { paths: Array.from(new Set(paths)) });
+      if (imported.length === 0) return;
+      setTracks(prev => dedupeTracks([...prev, ...imported]));
+      setQueue(imported);
+      setCurrentTrack(imported[0]);
+      setBrowseMode("songs");
+      setSelectedFolderPath(null);
+      setSelectedAlbumKey(null);
+      setSelectedPlaylistId(null);
+      setSearchQuery("");
+      setIsSearchOpen(false);
+      showImportNotice(imported);
+    } catch (e) {
+      console.error("file import failed", e);
+    }
+  }, [isTauri, showImportNotice]);
+
+  const drainLaunchFiles = useCallback(async () => {
+    if (!isTauri) return;
+    const files = await invoke<string[]>("get_launch_files");
+    if (files.length > 0) await importAndPlayFiles(files);
+  }, [isTauri, importAndPlayFiles]);
+
   useEffect(() => {
     if (!isTauri) return;
     const fetchLibrary = () => {
@@ -561,19 +645,31 @@ function App() {
         .catch(console.error);
     };
 
-    fetchLibrary();
+    // Import launch files before the first library fetch so they're included in it
+    (async () => {
+      try {
+        await drainLaunchFiles();
+      } catch (e) {
+        console.error("launch files failed", e);
+      }
+      fetchLibrary();
+    })();
     refreshFolders();
     refreshPlaylists();
 
-    const unlisten = listen("metadata-updated", () => {
+    const unlistenMeta = listen("metadata-updated", () => {
       console.log("Metadata updated, refreshing library...");
       fetchLibrary();
     });
+    const unlistenOpen = listen("open-files", () => {
+      drainLaunchFiles().then(fetchLibrary).catch(console.error);
+    });
 
     return () => {
-      unlisten.then(f => f());
+      unlistenMeta.then(f => f());
+      unlistenOpen.then(f => f());
     };
-  }, [isTauri, refreshFolders, refreshPlaylists]);
+  }, [isTauri, refreshFolders, refreshPlaylists, drainLaunchFiles]);
 
   useEffect(() => {
     if (!isTauri || selectedPlaylistId === null) return;
@@ -741,14 +837,38 @@ function App() {
     if (refreshedTrack && refreshedTrack !== currentTrack) setCurrentTrack(refreshedTrack);
   }, [tracks, currentTrack?.file_path]);
 
+  // Keep queue entries in sync with refreshed library metadata (e.g. AcoustID updates)
+  useEffect(() => {
+    setQueue(prev => {
+      if (prev.length === 0) return prev;
+      const byPath = new Map(tracks.map(track => [track.file_path, track]));
+      let changed = false;
+      const next = prev.map(track => {
+        const refreshed = byPath.get(track.file_path);
+        if (refreshed && refreshed !== track) {
+          changed = true;
+          return refreshed;
+        }
+        return track;
+      });
+      return changed ? next : prev;
+    });
+  }, [tracks]);
+
   const { wavesurfer, isPlaying } = useWavesurfer({
     container: containerRef,
     height: 48,
-    waveColor: 'rgba(255, 255, 255, 0.4)',
-    progressColor: 'rgba(255, 255, 255, 0.9)',
+    waveColor: 'rgba(255, 255, 255, 0.44)',
+    progressColor: 'rgba(255, 255, 255, 0.78)',
+    cursorColor: 'rgba(255, 255, 255, 0.72)',
+    cursorWidth: 1,
     barWidth: 2,
     barGap: 1,
     barRadius: 2,
+    fillParent: true,
+    hideScrollbar: true,
+    autoScroll: false,
+    autoCenter: false,
   });
 
   const togglePlay = () => {
@@ -763,9 +883,12 @@ function App() {
     peaksRef.current = null;
     setCurrentTime(0);
     document.documentElement.style.setProperty('--audio-level', '0');
+    document.documentElement.style.setProperty('--wave-glow', '0px');
     if (containerRef.current) {
-      containerRef.current.style.transform = "";
-      containerRef.current.style.filter = "";
+      containerRef.current.style.removeProperty("transform");
+      containerRef.current.style.removeProperty("filter");
+      containerRef.current.style.setProperty("--wave-glow", "0px");
+      (containerRef.current.firstElementChild as HTMLElement | null)?.style.removeProperty("transform");
     }
     wavesurfer.stop();
     wavesurfer.empty?.();
@@ -791,7 +914,8 @@ function App() {
   }, [wavesurfer]);
 
   useEffect(() => {
-    if (wavesurfer) wavesurfer.setVolume(muted ? 0 : volume);
+    // Squared curve approximates perceptual loudness, so the lower half of the slider is usable
+    if (wavesurfer) wavesurfer.setVolume(muted ? 0 : volume * volume);
     localStorage.setItem("quaver_volume", String(volume));
   }, [wavesurfer, volume, muted]);
 
@@ -810,7 +934,8 @@ function App() {
       }
       if (cancelled || requestId !== playbackRequestRef.current) return;
       peaksRef.current = peaks && peaks.length ? peaks : null;
-      if (peaks && peaks.length) wavesurfer.load(url, [peaks]);
+      const duration = currentTrack.duration_secs || undefined;
+      if (peaks && peaks.length) wavesurfer.load(url, [peaks], duration);
       else wavesurfer.load(url);
     })();
 
@@ -969,35 +1094,86 @@ function App() {
         : "My Playlist";
   const currentAlbum = currentTrack?.album?.trim();
   const repeatLabel = repeatMode === "one" ? "Repeat one" : repeatMode === "all" ? "Repeat all" : "Repeat off";
-  const getShuffleIndex = () => {
-    if (filteredTracks.length === 0) return null;
-    if (filteredTracks.length === 1) return 0;
-    let nextIndex = currentIndex;
-    while (nextIndex === currentIndex) {
-      nextIndex = Math.floor(Math.random() * filteredTracks.length);
+
+  const queueIndex = currentTrack ? queue.findIndex(t => t.file_path === currentTrack.file_path) : -1;
+  const queuePathsKey = useMemo(() => queue.map(t => t.file_path).join("\u0000"), [queue]);
+  const shuffleOrderRef = useRef<number[]>([]);
+  const currentTrackPathRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    currentTrackPathRef.current = currentTrack?.file_path ?? null;
+  }, [currentTrack?.file_path]);
+
+  // A shuffled permutation of the queue: every track plays once per cycle, and
+  // prev/next walk the same sequence. Keyed on the queue's paths (not identity)
+  // so metadata refreshes don't reshuffle mid-listen.
+  useEffect(() => {
+    if (!shuffleEnabled || queue.length === 0) {
+      shuffleOrderRef.current = [];
+      return;
     }
-    return nextIndex;
+    const order = queue.map((_, index) => index);
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    const playingIndex = queue.findIndex(t => t.file_path === currentTrackPathRef.current);
+    if (playingIndex >= 0) {
+      const pos = order.indexOf(playingIndex);
+      if (pos > 0) {
+        order.splice(pos, 1);
+        order.unshift(playingIndex);
+      }
+    }
+    shuffleOrderRef.current = order;
+  }, [queuePathsKey, shuffleEnabled]);
+
+  const playTrack = (track: Track) => {
+    setQueue(filteredTracks);
+    setCurrentTrack(track);
   };
   const getNextTrackIndex = (wrap = repeatMode === "all") => {
-    if (filteredTracks.length === 0) return null;
-    if (shuffleEnabled) return getShuffleIndex();
-    if (currentIndex < 0) return 0;
-    if (currentIndex < filteredTracks.length - 1) return currentIndex + 1;
+    if (queue.length === 0) return null;
+    if (shuffleEnabled) {
+      const order = shuffleOrderRef.current;
+      if (order.length === 0) return null;
+      const pos = order.indexOf(queueIndex);
+      if (pos < 0) return order[0];
+      if (pos < order.length - 1) return order[pos + 1];
+      return wrap ? order[0] : null;
+    }
+    if (queueIndex < 0) return 0;
+    if (queueIndex < queue.length - 1) return queueIndex + 1;
     return wrap ? 0 : null;
   };
   const getPrevTrackIndex = () => {
-    if (filteredTracks.length === 0) return null;
-    if (shuffleEnabled) return getShuffleIndex();
-    if (currentIndex > 0) return currentIndex - 1;
-    return repeatMode === "all" ? filteredTracks.length - 1 : null;
+    if (queue.length === 0) return null;
+    if (shuffleEnabled) {
+      const order = shuffleOrderRef.current;
+      if (order.length === 0) return null;
+      const pos = order.indexOf(queueIndex);
+      if (pos < 0) return order[0];
+      if (pos > 0) return order[pos - 1];
+      return repeatMode === "all" ? order[order.length - 1] : null;
+    }
+    if (queueIndex > 0) return queueIndex - 1;
+    return repeatMode === "all" ? queue.length - 1 : null;
   };
   const playNext = () => {
+    if (queue.length === 0) {
+      if (filteredTracks.length > 0) playTrack(filteredTracks[0]);
+      return;
+    }
     const nextIndex = getNextTrackIndex();
-    if (nextIndex !== null) setCurrentTrack(filteredTracks[nextIndex]);
+    if (nextIndex !== null) setCurrentTrack(queue[nextIndex]);
   };
   const playPrev = () => {
+    if (queue.length === 0) {
+      if (filteredTracks.length > 0) playTrack(filteredTracks[0]);
+      return;
+    }
     const prevIndex = getPrevTrackIndex();
-    if (prevIndex !== null) setCurrentTrack(filteredTracks[prevIndex]);
+    if (prevIndex !== null) setCurrentTrack(queue[prevIndex]);
   };
   const cycleRepeatMode = () => {
     setRepeatMode(mode => mode === "off" ? "all" : mode === "all" ? "one" : "off");
@@ -1051,6 +1227,114 @@ function App() {
       console.error("playlist create failed", e);
     }
   };
+  const openPlaylistPicker = (track: Track, event: React.MouseEvent) => {
+    event.stopPropagation();
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    setPickerPos({ x: rect.left, y: rect.bottom });
+    setPickerTrack(track);
+    setPickerCreating(false);
+    setPickerNewName("");
+  };
+  const closePlaylistPicker = () => {
+    setPickerTrack(null);
+    setPickerPos(null);
+    setPickerCreating(false);
+    setPickerNewName("");
+  };
+  const handleAddTrackToPlaylist = async (playlistId: number) => {
+    if (!isTauri || !pickerTrack) return;
+    const track = pickerTrack;
+    try {
+      const updated = await invoke<PlaylistSummary>("add_tracks_to_playlist", {
+        playlistId,
+        filePaths: [track.file_path],
+      });
+      setPlaylists(prev => prev.map(playlist => playlist.id === updated.id ? updated : playlist));
+      setPlaylistTracks(prev => {
+        const existing = prev[playlistId];
+        if (!existing || existing.some(item => item.file_path === track.file_path)) return prev;
+        return { ...prev, [playlistId]: [...existing, track] };
+      });
+      closePlaylistPicker();
+    } catch (e) {
+      console.error("add to playlist failed", e);
+    }
+  };
+  const handleCreatePlaylistWithTrack = async () => {
+    if (!isTauri || !pickerTrack) return;
+    const name = pickerNewName.trim();
+    if (!name) return;
+    try {
+      const created = await invoke<PlaylistSummary>("create_playlist_from_tracks", {
+        name,
+        filePaths: [pickerTrack.file_path],
+      });
+      setPlaylists(prev => [created, ...prev.filter(playlist => playlist.id !== created.id)]);
+      setPlaylistTracks(prev => ({ ...prev, [created.id]: [pickerTrack] }));
+      closePlaylistPicker();
+    } catch (e) {
+      console.error("create playlist with track failed", e);
+    }
+  };
+  const startRenamePlaylist = (playlist: PlaylistSummary) => {
+    setRenamingPlaylistId(playlist.id);
+    setRenameValue(playlist.name);
+    setConfirmingDeletePlaylistId(null);
+  };
+  const handleRenamePlaylist = async () => {
+    if (!isTauri || renamingPlaylistId === null) return;
+    const name = renameValue.trim();
+    if (!name) return;
+    try {
+      const updated = await invoke<PlaylistSummary>("rename_playlist", {
+        playlistId: renamingPlaylistId,
+        name,
+      });
+      setPlaylists(prev => prev.map(playlist => playlist.id === updated.id ? updated : playlist));
+      setRenamingPlaylistId(null);
+      setRenameValue("");
+    } catch (e) {
+      console.error("playlist rename failed", e);
+    }
+  };
+  const handleDeletePlaylist = async (playlistId: number) => {
+    if (!isTauri) return;
+    try {
+      await invoke("delete_playlist", { playlistId });
+      setPlaylists(prev => prev.filter(playlist => playlist.id !== playlistId));
+      setPlaylistTracks(prev => {
+        const next = { ...prev };
+        delete next[playlistId];
+        return next;
+      });
+      if (selectedPlaylistId === playlistId) setSelectedPlaylistId(null);
+      setConfirmingDeletePlaylistId(null);
+    } catch (e) {
+      console.error("playlist delete failed", e);
+    }
+  };
+  const movePlaylistTrack = async (track: Track, direction: -1 | 1) => {
+    if (!isTauri || selectedPlaylistId === null) return;
+    const list = playlistTracks[selectedPlaylistId] ?? [];
+    const index = list.findIndex(item => item.file_path === track.file_path);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= list.length) return;
+    const next = [...list];
+    [next[index], next[target]] = [next[target], next[index]];
+    setPlaylistTracks(prev => ({ ...prev, [selectedPlaylistId]: next }));
+    try {
+      const updated = await invoke<PlaylistSummary>("set_playlist_order", {
+        playlistId: selectedPlaylistId,
+        filePaths: next.map(item => item.file_path),
+      });
+      setPlaylists(prev => prev.map(playlist => playlist.id === updated.id ? updated : playlist));
+    } catch (e) {
+      console.error("playlist reorder failed", e);
+      invoke<Track[]>("get_playlist_tracks", { playlistId: selectedPlaylistId })
+        .then(items => setPlaylistTracks(prev => ({ ...prev, [selectedPlaylistId]: dedupeTracks(items) })))
+        .catch(console.error);
+    }
+  };
   const handleRemoveFromPlaylist = async (track: Track) => {
     if (!isTauri || selectedPlaylistId === null) return;
     try {
@@ -1081,11 +1365,11 @@ function App() {
       }
 
       const nextIndex = getNextTrackIndex(repeatMode === "all");
-      if (nextIndex !== null) setCurrentTrack(filteredTracks[nextIndex]);
+      if (nextIndex !== null) setCurrentTrack(queue[nextIndex]);
     };
     wavesurfer.on("finish", onFinish);
     return () => wavesurfer.un("finish", onFinish);
-  }, [wavesurfer, currentTrack, filteredTracks, shuffleEnabled, repeatMode]);
+  }, [wavesurfer, currentTrack, queue, shuffleEnabled, repeatMode]);
 
   useEffect(() => {
     if (!wavesurfer) return;
@@ -1109,13 +1393,32 @@ function App() {
           // peak envelope at the playhead, lightly boosted, clamped to 0..1
           target = Math.min(1, ((Math.abs(min) + Math.abs(max)) / 2) * 1.6);
         }
+      } else if (wavesurfer.isPlaying()) {
+        const decoded = wavesurfer.getDecodedData?.();
+        const dur = wavesurfer.getDuration() || decoded?.duration || 0;
+        const channel = decoded?.getChannelData(0);
+        if (channel && channel.length > 0 && dur > 0) {
+          const center = Math.floor((wavesurfer.getCurrentTime() / dur) * channel.length);
+          const radius = 420;
+          const start = Math.max(0, center - radius);
+          const end = Math.min(channel.length, center + radius);
+          let sum = 0;
+          for (let i = start; i < end; i += 1) sum += channel[i] * channel[i];
+          const rms = end > start ? Math.sqrt(sum / (end - start)) : 0;
+          target = Math.min(1, rms * 5.2);
+        } else {
+          target = 0.1;
+        }
       }
       display += (target - display) * 0.18; // easing → fluid, not twitchy
       document.documentElement.style.setProperty('--audio-level', display.toString());
       if (el) {
-        el.style.transformOrigin = "center";
-        el.style.transform = `scaleY(${1 + display * 0.08})`;
-        el.style.filter = `drop-shadow(0 0 ${display * 12}px var(--bg-color-1, rgba(255,255,255,0.4)))`;
+        const waveformNode = el.firstElementChild as HTMLElement | null;
+        if (waveformNode) {
+          waveformNode.style.transformOrigin = "center";
+          waveformNode.style.transform = `scaleY(${1 + display * 0.12})`;
+        }
+        el.style.setProperty("--wave-glow", `${display * 12}px`);
       }
       raf = requestAnimationFrame(tick);
     };
@@ -1125,14 +1428,24 @@ function App() {
   }, [wavesurfer]);
 
   useEffect(() => {
-    if (!isTauri || !currentTrack) return;
-    const idx = filteredTracks.findIndex(t => t.file_path === currentTrack.file_path);
-    if (idx < 0) return;
-    const upcoming = [filteredTracks[idx + 1], filteredTracks[idx + 2]].filter(Boolean);
+    if (!isTauri || !currentTrack || queue.length === 0) return;
+    const upcoming: Track[] = [];
+    if (shuffleEnabled) {
+      const order = shuffleOrderRef.current;
+      const pos = order.indexOf(queueIndex);
+      if (pos >= 0) {
+        for (const orderPos of [pos + 1, pos + 2]) {
+          const idx = order[orderPos];
+          if (idx !== undefined) upcoming.push(queue[idx]);
+        }
+      }
+    } else if (queueIndex >= 0) {
+      upcoming.push(...[queue[queueIndex + 1], queue[queueIndex + 2]].filter(Boolean));
+    }
     upcoming.forEach(t => {
       invoke("get_waveform_peaks", { filePath: t.file_path }).catch(() => {});
     });
-  }, [currentTrack, filteredTracks, isTauri]);
+  }, [currentTrack, queue, queueIndex, shuffleEnabled, isTauri]);
 
   return (
     <div className="app-container">
@@ -1372,15 +1685,82 @@ function App() {
                   <div
                     key={playlist.id}
                     className="source-row"
-                    onClick={() => setSelectedPlaylistId(playlist.id)}
+                    onClick={() => {
+                      if (renamingPlaylistId !== playlist.id) setSelectedPlaylistId(playlist.id);
+                    }}
                   >
                     <div className="source-icon playlist-source-icon">
                       <ListMusic size={18} />
                     </div>
-                    <div className="source-row-main">
-                      <div className="source-row-title">{playlist.name}</div>
-                      <div className="source-row-subtitle">{playlist.track_count} tracks{formatMinutesLabel(playlist.duration_secs) ? ` · ${formatMinutesLabel(playlist.duration_secs)}` : ""}</div>
-                    </div>
+                    {renamingPlaylistId === playlist.id ? (
+                      <form
+                        className="playlist-rename-form"
+                        onClick={(event) => event.stopPropagation()}
+                        onSubmit={(event) => { event.preventDefault(); handleRenamePlaylist(); }}
+                      >
+                        <input
+                          value={renameValue}
+                          onChange={(event) => setRenameValue(event.target.value)}
+                          autoFocus
+                          placeholder="Playlist name"
+                        />
+                        <button type="submit" className="track-row-action visible" title="Save name">
+                          <Check size={13} />
+                        </button>
+                        <button
+                          type="button"
+                          className="track-row-action visible"
+                          title="Cancel"
+                          onClick={() => setRenamingPlaylistId(null)}
+                        >
+                          <X size={13} />
+                        </button>
+                      </form>
+                    ) : (
+                      <>
+                        <div className="source-row-main">
+                          <div className="source-row-title">{playlist.name}</div>
+                          <div className="source-row-subtitle">{playlist.track_count} tracks{formatMinutesLabel(playlist.duration_secs) ? ` · ${formatMinutesLabel(playlist.duration_secs)}` : ""}</div>
+                        </div>
+                        <div className="track-row-actions" onClick={(event) => event.stopPropagation()}>
+                          {confirmingDeletePlaylistId === playlist.id ? (
+                            <>
+                              <button
+                                className="track-row-action danger visible"
+                                onClick={() => handleDeletePlaylist(playlist.id)}
+                                title="Confirm delete"
+                              >
+                                <Check size={13} />
+                              </button>
+                              <button
+                                className="track-row-action visible"
+                                onClick={() => setConfirmingDeletePlaylistId(null)}
+                                title="Cancel"
+                              >
+                                <X size={13} />
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                className="track-row-action"
+                                onClick={() => startRenamePlaylist(playlist)}
+                                title="Rename playlist"
+                              >
+                                <Pencil size={13} />
+                              </button>
+                              <button
+                                className="track-row-action danger"
+                                onClick={() => setConfirmingDeletePlaylistId(playlist.id)}
+                                title="Delete playlist"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </>
+                    )}
                   </div>
                 ))}
               </>
@@ -1393,7 +1773,7 @@ function App() {
                   <div 
                     key={track.file_path}
                     className={`track-row ${currentTrack?.file_path === track.file_path ? "active" : ""}`}
-                    onClick={() => setCurrentTrack(track)}
+                    onClick={() => playTrack(track)}
                   >
                     <TrackThumbnail
                       track={track}
@@ -1404,18 +1784,51 @@ function App() {
                       <div className="track-row-title">{getTrackName(track)}</div>
                       <div className="track-row-artist">{track.artist || "Unknown Artist"}</div>
                     </div>
-                    {browseMode === "playlists" && selectedPlaylistId !== null && (
+                    <div className="track-row-actions">
+                      {browseMode === "playlists" && selectedPlaylistId !== null && searchQuery === "" && (
+                        <>
+                          <button
+                            className="track-row-action"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              movePlaylistTrack(track, -1);
+                            }}
+                            title="Move up"
+                          >
+                            <ChevronUp size={13} />
+                          </button>
+                          <button
+                            className="track-row-action"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              movePlaylistTrack(track, 1);
+                            }}
+                            title="Move down"
+                          >
+                            <ChevronDown size={13} />
+                          </button>
+                        </>
+                      )}
                       <button
-                        className="track-remove-button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          handleRemoveFromPlaylist(track);
-                        }}
-                        title="Remove from playlist"
+                        className="track-row-action"
+                        onClick={(event) => openPlaylistPicker(track, event)}
+                        title="Add to playlist"
                       >
-                        <Trash2 size={13} />
+                        <ListPlus size={13} />
                       </button>
-                    )}
+                      {browseMode === "playlists" && selectedPlaylistId !== null && (
+                        <button
+                          className="track-row-action danger"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleRemoveFromPlaylist(track);
+                          }}
+                          title="Remove from playlist"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </div>
                     {currentTrack?.file_path === track.file_path && (
                       <Volume2 className="track-playing-indicator" size={14} aria-hidden="true" />
                     )}
@@ -1488,6 +1901,14 @@ function App() {
           </div>
 
           <div className="utility-controls">
+            <button
+              className="icon-btn"
+              onClick={(event) => { if (currentTrack) openPlaylistPicker(currentTrack, event); }}
+              disabled={!currentTrack}
+              title="Add current song to playlist"
+            >
+              <ListPlus size={19} />
+            </button>
             <button className={`icon-btn visualizer-btn ${visualizer}`} onClick={() => {
               setVisualizer((mode) => VISUALIZER_MODES[(VISUALIZER_MODES.indexOf(mode) + 1) % VISUALIZER_MODES.length]);
             }} title={`Visualizer: ${visualizer}`}>
@@ -1513,6 +1934,75 @@ function App() {
           </div>
         </div>
       </div>
+
+      {importNotice && (
+        <div className="import-toast" key={importNotice.id} role="status">
+          <div className="import-toast-icon">
+            <ListPlus size={16} />
+          </div>
+          <div className="import-toast-copy">
+            <div className="import-toast-title">{importNotice.title}</div>
+            <div className="import-toast-detail">{importNotice.detail}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Add-to-playlist picker */}
+      {pickerTrack && pickerPos && (
+        <>
+          <div className="picker-overlay" onClick={closePlaylistPicker} />
+          <div
+            className="playlist-picker"
+            style={{
+              left: Math.max(8, Math.min(pickerPos.x, window.innerWidth - 248)),
+              top: Math.max(8, Math.min(pickerPos.y + 6, window.innerHeight - 320)),
+            }}
+          >
+            <div className="playlist-picker-header">Add to playlist</div>
+            <div className="playlist-picker-track">{getTrackName(pickerTrack)}</div>
+            <div className="playlist-picker-list">
+              {playlists.length === 0 && (
+                <div className="playlist-picker-empty">No playlists yet</div>
+              )}
+              {playlists.map((playlist) => (
+                <button
+                  key={playlist.id}
+                  className="playlist-picker-item"
+                  onClick={() => handleAddTrackToPlaylist(playlist.id)}
+                >
+                  <ListMusic size={14} />
+                  <span className="playlist-picker-name">{playlist.name}</span>
+                  <span className="playlist-picker-count">{playlist.track_count}</span>
+                </button>
+              ))}
+            </div>
+            {pickerCreating ? (
+              <form
+                className="playlist-picker-new"
+                onSubmit={(event) => { event.preventDefault(); handleCreatePlaylistWithTrack(); }}
+              >
+                <input
+                  value={pickerNewName}
+                  onChange={(event) => setPickerNewName(event.target.value)}
+                  autoFocus
+                  placeholder="Playlist name"
+                />
+                <button type="submit" title="Create playlist">
+                  <Check size={14} />
+                </button>
+              </form>
+            ) : (
+              <button
+                className="playlist-picker-item playlist-picker-create"
+                onClick={() => { setPickerCreating(true); setPickerNewName(""); }}
+              >
+                <Plus size={14} />
+                <span className="playlist-picker-name">New playlist…</span>
+              </button>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

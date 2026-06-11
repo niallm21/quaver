@@ -13,19 +13,23 @@ pub struct TrackMetadata {
     pub duration_secs: Option<f64>,
 }
 
+pub const SUPPORTED_EXTS: [&str; 7] = ["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"];
+
+pub fn is_supported_audio(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| SUPPORTED_EXTS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 pub fn scan_directory(dir: &str) -> Vec<TrackMetadata> {
     let mut files = Vec::new();
-    let supported_exts = ["mp3", "wav", "flac", "ogg"];
-    
+
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if supported_exts.contains(&ext.to_lowercase().as_str()) {
-                    if let Some(meta) = read_metadata(&path) {
-                        files.push(meta);
-                    }
-                }
+        if path.is_file() && is_supported_audio(path) {
+            if let Some(meta) = read_metadata(path) {
+                files.push(meta);
             }
         }
     }

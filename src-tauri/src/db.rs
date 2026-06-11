@@ -1,10 +1,15 @@
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub fn init_db(app_data_dir: &PathBuf) -> Result<Connection> {
     let db_path = app_data_dir.join("quaver.db");
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // WAL keeps readers responsive while scans write; journal_mode returns a row,
+    // so query_row instead of pragma_update.
+    let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()));
+    let _ = conn.busy_timeout(Duration::from_secs(5));
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tracks (
@@ -36,6 +41,17 @@ pub fn init_db(app_data_dir: &PathBuf) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS folders (
             path TEXT PRIMARY KEY,
             added_at INTEGER
+        )",
+        [],
+    )?;
+
+    // Downloaded album art, keyed by the lowercased search query.
+    // An empty blob records a confirmed miss so we don't re-query every launch.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS art_cache (
+            cache_key TEXT PRIMARY KEY,
+            data BLOB NOT NULL,
+            fetched_at INTEGER NOT NULL
         )",
         [],
     )?;

@@ -529,9 +529,46 @@ body {
 
 .waveform-host {
   width: 100%;
-  height: 48px;
-  min-height: 48px;
+  height: 56px;
+  min-height: 56px;
   position: relative;
+  display: flex;
+  align-items: center;
+  overflow: visible;
+  contain: layout style;
+  isolation: isolate;
+  --wave-glow: 0px;
+  filter: drop-shadow(0 0 var(--wave-glow) var(--bg-color-1, rgba(255, 255, 255, 0.4)));
+}
+
+.waveform-host > div {
+  width: 100%;
+  height: 48px;
+  will-change: transform;
+}
+
+.waveform-host > div::part(wrapper) {
+  overflow: visible;
+}
+
+.waveform-host > div::part(scroll) {
+  overflow: hidden !important;
+  scrollbar-width: none;
+}
+
+.waveform-host > div::part(scroll)::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.waveform-host > div::part(progress) {
+  opacity: 0.92;
+}
+
+.waveform-host > div::part(cursor) {
+  border-radius: 999px;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.22);
 }
 
 .track-row {
@@ -662,7 +699,14 @@ body {
   opacity: 0.72;
 }
 
-.track-remove-button {
+.track-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.track-row-action {
   flex: 0 0 auto;
   width: 26px;
   height: 26px;
@@ -678,14 +722,241 @@ body {
   transition: opacity 0.18s ease, background 0.18s ease;
 }
 
-.track-row:hover .track-remove-button,
-.track-remove-button:focus-visible {
+.track-row:hover .track-row-action,
+.source-row:hover .track-row-action,
+.track-row-action.visible,
+.track-row-action:focus-visible {
   opacity: 0.78;
 }
 
-.track-remove-button:hover {
+.track-row-action:hover {
   opacity: 1;
   background: rgba(255, 255, 255, 0.16);
+}
+
+.track-row-action.danger {
+  color: #ff8585;
+}
+
+.playlist-rename-form {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.playlist-rename-form input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: white;
+  outline: none;
+  padding: 0 9px;
+  font-size: 0.78rem;
+}
+
+.picker-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 95;
+}
+
+.playlist-picker {
+  position: fixed;
+  z-index: 96;
+  width: 240px;
+  max-height: 312px;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  background: rgba(30, 30, 40, 0.92);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.playlist-picker-header {
+  font-size: 0.7rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.6;
+  padding: 2px 6px 0;
+}
+
+.playlist-picker-track {
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 2px 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.playlist-picker-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.playlist-picker-empty {
+  opacity: 0.5;
+  font-size: 0.76rem;
+  padding: 8px 6px;
+  text-align: center;
+}
+
+.playlist-picker-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: white;
+  text-align: left;
+  padding: 8px 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.playlist-picker-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.playlist-picker-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.playlist-picker-count {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  opacity: 0.55;
+}
+
+.playlist-picker-create {
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0 0 6px 6px;
+  margin-top: 4px;
+}
+
+.playlist-picker-new {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin-top: 4px;
+  padding-top: 8px;
+}
+
+.playlist-picker-new input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: white;
+  outline: none;
+  padding: 0 9px;
+  font-size: 0.78rem;
+}
+
+.playlist-picker-new button {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.12);
+  color: white;
+  cursor: pointer;
+}
+
+.playlist-picker-new button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.import-toast {
+  position: fixed;
+  right: 16px;
+  top: 46px;
+  z-index: 94;
+  max-width: min(310px, calc(100vw - 32px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 10px;
+  background: rgba(24, 24, 32, 0.72);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  animation: import-toast-in 0.24s ease both;
+}
+
+.import-toast-icon {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.import-toast-copy {
+  min-width: 0;
+}
+
+.import-toast-title {
+  font-size: 0.82rem;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.import-toast-detail {
+  margin-top: 3px;
+  max-width: 238px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.74rem;
+  line-height: 1.1;
+  opacity: 0.72;
+}
+
+@keyframes import-toast-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
 }
 
 .empty-state {
@@ -818,6 +1089,11 @@ body {
 }
 
 .icon-btn.is-active,
+.utility-controls .icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .utility-controls .icon-btn.is-active {
   opacity: 1;
   background: rgba(255, 255, 255, 0.18);
@@ -849,8 +1125,8 @@ body {
   }
 
   .waveform-host {
-    height: 42px;
-    min-height: 42px;
+    height: 54px;
+    min-height: 54px;
   }
 
   .track-info {
@@ -897,8 +1173,8 @@ body {
   }
 
   .waveform-host {
-    height: 48px;
-    min-height: 48px;
+    height: 52px;
+    min-height: 52px;
   }
 
   .time-label {

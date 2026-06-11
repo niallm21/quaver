@@ -4,7 +4,7 @@ mod waveform;
 pub mod metadata;
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use std::sync::Mutex;
 use rusqlite::Connection;
@@ -15,7 +15,117 @@ use crate::scanner::TrackMetadata;
 
 struct AppState {
     db: Mutex<Option<Connection>>,
+    // Audio files passed on the command line (e.g. double-clicked in Explorer),
+    // held until the frontend is ready to ask for them.
+    pending_files: Mutex<Vec<String>>,
 }
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn audio_path_from_arg(arg: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let raw = arg.trim().trim_matches('"').trim_matches('\'').trim();
+    if raw.is_empty() || raw.starts_with('-') {
+        return None;
+    }
+
+    let lower = raw.to_ascii_lowercase();
+    let path_text = if lower.starts_with("file://") {
+        let mut rest = &raw[7..];
+        if rest.starts_with('/') && rest.as_bytes().get(2) == Some(&b':') {
+            rest = &rest[1..];
+        }
+        if rest.starts_with('/') {
+            percent_decode_lossy(rest)
+        } else {
+            format!(r"\\{}", percent_decode_lossy(rest).replace('/', r"\"))
+        }
+    } else {
+        raw.to_string()
+    };
+
+    let path = PathBuf::from(path_text);
+    let path = if path.is_relative() {
+        cwd.map(|base| base.join(path))?
+    } else {
+        path
+    };
+    let path = path.canonicalize().unwrap_or(path);
+
+    if path.is_file() && scanner::is_supported_audio(&path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn audio_files_from_args<'a>(args: impl Iterator<Item = &'a String>, cwd: Option<&Path>) -> Vec<String> {
+    let mut files = Vec::new();
+    for arg in args {
+        if let Some(path) = audio_path_from_arg(arg, cwd) {
+            let file = path.to_string_lossy().to_string();
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    files
+}
+
+fn allow_audio_files(app: &tauri::AppHandle, files: &[String]) {
+    for file in files {
+        let _ = app.asset_protocol_scope().allow_file(file);
+        let _ = app.fs_scope().allow_file(file);
+    }
+}
+
+fn queue_audio_files(app: &tauri::AppHandle, files: Vec<String>) {
+    if files.is_empty() {
+        return;
+    }
+
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut pending) = state.pending_files.lock() {
+            for file in files {
+                if !pending.contains(&file) {
+                    pending.push(file);
+                }
+            }
+        }
+        let _ = app.emit("open-files", ());
+    } else {
+        let _ = app.emit("open-files", ());
+    }
+}
+
+// Upsert keeps the existing row in place. INSERT OR REPLACE would delete + reinsert,
+// and with foreign_keys ON the delete cascades into playlist_tracks, silently
+// emptying playlists on every rescan. COALESCE preserves metadata recovered by the
+// AcoustID fetcher when the file's own tags are missing.
+const UPSERT_TRACK_SQL: &str =
+    "INSERT INTO tracks (file_path, title, artist, album, duration_secs, scanned_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+     ON CONFLICT(file_path) DO UPDATE SET
+        title = COALESCE(excluded.title, title),
+        artist = COALESCE(excluded.artist, artist),
+        album = COALESCE(excluded.album, album),
+        duration_secs = excluded.duration_secs,
+        scanned_at = excluded.scanned_at";
 
 fn file_modified_time(path: &Path) -> i64 {
     path.metadata()
@@ -52,29 +162,30 @@ struct PlaylistSummary {
 async fn scan_folder(folder_path: String, app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<TrackMetadata>, String> {
     app_handle.fs_scope().allow_directory(&folder_path, true).map_err(|e| e.to_string())?;
     let _ = app_handle.asset_protocol_scope().allow_directory(&folder_path, true);
-    let files = scanner::scan_directory(&folder_path);
-    
-    let db_guard = state.db.lock().map_err(|e| e.to_string())?;
-    if let Some(conn) = db_guard.as_ref() {
-        let _ = conn.execute(
+    let scan_path = folder_path.clone();
+    let files = tokio::task::spawn_blocking(move || scanner::scan_directory(&scan_path))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut db_guard = state.db.lock().map_err(|e| e.to_string())?;
+    if let Some(conn) = db_guard.as_mut() {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let _ = tx.execute(
             "INSERT OR REPLACE INTO folders (path, added_at) VALUES (?1, strftime('%s','now'))",
             (&folder_path,),
         );
         for track in &files {
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO tracks (file_path, title, artist, album, duration_secs, scanned_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))",
-                (
-                    &track.file_path,
-                    &track.title,
-                    &track.artist,
-                    &track.album,
-                    &track.duration_secs,
-                ),
-            );
+            let _ = tx.execute(UPSERT_TRACK_SQL, (
+                &track.file_path,
+                &track.title,
+                &track.artist,
+                &track.album,
+                &track.duration_secs,
+            ));
         }
+        tx.commit().map_err(|e| e.to_string())?;
     }
-    
+
     Ok(files)
 }
 
@@ -84,29 +195,31 @@ async fn get_waveform_peaks(file_path: String, state: tauri::State<'_, AppState>
     let modified_time = file_modified_time(&path);
 
     // Check cache in db first
-    let db_guard = state.db.lock().map_err(|e| e.to_string())?;
-    if let Some(conn) = db_guard.as_ref() {
-        let mut stmt = conn.prepare("SELECT peaks_json, COALESCE(modified_time, 0) FROM peaks WHERE file_path = ?1")
-            .map_err(|e| e.to_string())?;
-        
-        let cached: Option<(String, i64)> = stmt.query_row([&file_path], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).ok();
-        
-        if let Some((peaks_json, cached_modified_time)) = cached {
-            if let Ok(peaks) = serde_json::from_str::<Vec<f32>>(&peaks_json) {
-                if cached_modified_time == modified_time {
-                    return Ok(peaks);
+    {
+        let db_guard = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(conn) = db_guard.as_ref() {
+            let mut stmt = conn.prepare("SELECT peaks_json, COALESCE(modified_time, 0) FROM peaks WHERE file_path = ?1")
+                .map_err(|e| e.to_string())?;
+
+            let cached: Option<(String, i64)> = stmt.query_row([&file_path], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            }).ok();
+
+            if let Some((peaks_json, cached_modified_time)) = cached {
+                if let Ok(peaks) = serde_json::from_str::<Vec<f32>>(&peaks_json) {
+                    // modified_time of 0 means the file is unreadable; don't trust a match on it
+                    if cached_modified_time == modified_time && modified_time != 0 {
+                        return Ok(peaks);
+                    }
                 }
             }
         }
     }
-    
-    // Drop guard before heavy work
-    drop(db_guard);
-    
-    // Generate peaks (approx 1000 min/max pairs = 2000 items)
-    let peaks = waveform::generate_peaks(&path, 1000)?;
+
+    // Generate peaks (approx 1000 min/max pairs = 2000 items) off the async runtime
+    let peaks = tokio::task::spawn_blocking(move || waveform::generate_peaks(&path, 1000))
+        .await
+        .map_err(|e| e.to_string())??;
     
     // Cache the result
     if let Ok(db_guard) = state.db.lock() {
@@ -122,16 +235,18 @@ async fn get_waveform_peaks(file_path: String, state: tauri::State<'_, AppState>
     Ok(peaks)
 }
 
+// Art is returned as a raw-bytes IPC response (ArrayBuffer on the JS side) instead of
+// a JSON number array; an empty body means "no art".
 #[tauri::command]
-fn get_track_art(file_path: String) -> Result<Option<Vec<u8>>, String> {
-    let path = std::path::PathBuf::from(&file_path);
-    scanner::read_art(&path).map_err(|e| e.to_string())
+async fn get_track_art(file_path: String) -> Result<tauri::ipc::Response, String> {
+    let path = std::path::PathBuf::from(file_path);
+    let art = tokio::task::spawn_blocking(move || scanner::read_art(&path))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(art.unwrap_or_default()))
 }
 
-#[tauri::command]
-async fn get_fallback_art(query: String) -> Result<Option<Vec<u8>>, String> {
-    metadata::fetch_album_art(&query).await
-}
+const ART_MISS_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[tauri::command]
 async fn get_track_preview_art(
@@ -139,10 +254,14 @@ async fn get_track_preview_art(
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
-) -> Result<Option<Vec<u8>>, String> {
+    state: tauri::State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
     let path = std::path::PathBuf::from(&file_path);
-    if let Ok(Some(art)) = scanner::read_art(&path) {
-        return Ok(Some(art));
+    let embedded = tokio::task::spawn_blocking(move || scanner::read_art(&path))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(Some(art)) = embedded {
+        return Ok(tauri::ipc::Response::new(art));
     }
 
     let query = if let (Some(artist), Some(album)) = (artist.as_deref(), album.as_deref()) {
@@ -153,11 +272,46 @@ async fn get_track_preview_art(
         None
     };
 
-    if let Some(query) = query {
-        metadata::fetch_album_art(&query).await
-    } else {
-        Ok(None)
+    let Some(query) = query else {
+        return Ok(tauri::ipc::Response::new(Vec::new()));
+    };
+    let cache_key = query.to_lowercase();
+
+    // Serve from the persistent cache so launches don't re-download the library's art.
+    {
+        let guard = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(conn) = guard.as_ref() {
+            let cached: Option<(Vec<u8>, i64)> = conn
+                .query_row(
+                    "SELECT data, strftime('%s','now') - fetched_at FROM art_cache WHERE cache_key = ?1",
+                    [&cache_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            if let Some((data, age_secs)) = cached {
+                if !data.is_empty() {
+                    return Ok(tauri::ipc::Response::new(data));
+                }
+                if age_secs < ART_MISS_TTL_SECS {
+                    return Ok(tauri::ipc::Response::new(Vec::new()));
+                }
+            }
+        }
     }
+
+    // Cache both hits and confirmed misses; network errors propagate uncached so a
+    // flaky connection doesn't poison the cache.
+    let art = metadata::fetch_album_art(&query).await?;
+    let data = art.unwrap_or_default();
+    if let Ok(guard) = state.db.lock() {
+        if let Some(conn) = guard.as_ref() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO art_cache (cache_key, data, fetched_at) VALUES (?1, ?2, strftime('%s','now'))",
+                (&cache_key, &data),
+            );
+        }
+    }
+    Ok(tauri::ipc::Response::new(data))
 }
 
 #[tauri::command]
@@ -397,6 +551,57 @@ fn get_playlist_tracks(
 }
 
 #[tauri::command]
+fn rename_playlist(
+    playlist_id: i64,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<PlaylistSummary, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Playlist name cannot be empty".into());
+    }
+
+    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = guard.as_ref().ok_or("db not initialised")?;
+    conn.execute(
+        "UPDATE playlists SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+        (trimmed, playlist_id),
+    )
+    .map_err(|e| e.to_string())?;
+    playlist_summary(conn, playlist_id)
+}
+
+#[tauri::command]
+fn delete_playlist(playlist_id: i64, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = guard.as_ref().ok_or("db not initialised")?;
+    // playlist_tracks rows go with it via ON DELETE CASCADE
+    conn.execute("DELETE FROM playlists WHERE id = ?1", [playlist_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_playlist_order(
+    playlist_id: i64,
+    file_paths: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<PlaylistSummary, String> {
+    let mut guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = guard.as_mut().ok_or("db not initialised")?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (index, file_path) in file_paths.iter().enumerate() {
+        let _ = tx.execute(
+            "UPDATE playlist_tracks SET position = ?1 WHERE playlist_id = ?2 AND file_path = ?3",
+            (index as i64, playlist_id, file_path),
+        );
+    }
+    let _ = tx.execute("UPDATE playlists SET updated_at = strftime('%s','now') WHERE id = ?1", [playlist_id]);
+    tx.commit().map_err(|e| e.to_string())?;
+    playlist_summary(conn, playlist_id)
+}
+
+#[tauri::command]
 fn remove_track_from_playlist(
     playlist_id: i64,
     file_path: String,
@@ -436,23 +641,29 @@ async fn rescan_library(
     for folder in &folders {
         let _ = app_handle.fs_scope().allow_directory(folder, true);
         let _ = app_handle.asset_protocol_scope().allow_directory(folder, true);
-        let files = scanner::scan_directory(folder);
-        let guard = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(conn) = guard.as_ref() {
+        let scan_path = folder.clone();
+        let files = tokio::task::spawn_blocking(move || scanner::scan_directory(&scan_path))
+            .await
+            .map_err(|e| e.to_string())?;
+        for track in &files {
+            seen_paths.insert(track.file_path.clone());
+        }
+        let mut guard = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(conn) = guard.as_mut() {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
             for track in &files {
-                seen_paths.insert(track.file_path.clone());
-                let _ = conn.execute(
-                    "INSERT OR REPLACE INTO tracks (file_path, title, artist, album, duration_secs, scanned_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))",
+                let _ = tx.execute(
+                    UPSERT_TRACK_SQL,
                     (&track.file_path, &track.title, &track.artist, &track.album, &track.duration_secs),
                 );
             }
+            tx.commit().map_err(|e| e.to_string())?;
         }
     }
 
     if !folders.is_empty() {
-        let guard = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(conn) = guard.as_ref() {
+        let mut guard = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(conn) = guard.as_mut() {
             let existing_paths: Vec<String> = {
                 let mut stmt = conn
                     .prepare("SELECT file_path FROM tracks")
@@ -463,17 +674,19 @@ async fn rescan_library(
                 rows.filter_map(|row| row.ok()).collect()
             };
 
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
             for file_path in existing_paths {
                 if seen_paths.contains(&file_path) {
                     continue;
                 }
 
                 if folders.iter().any(|folder| path_is_in_folder(&file_path, folder)) {
-                    let _ = conn.execute("DELETE FROM playlist_tracks WHERE file_path = ?1", [&file_path]);
-                    let _ = conn.execute("DELETE FROM peaks WHERE file_path = ?1", [&file_path]);
-                    let _ = conn.execute("DELETE FROM tracks WHERE file_path = ?1", [&file_path]);
+                    let _ = tx.execute("DELETE FROM playlist_tracks WHERE file_path = ?1", [&file_path]);
+                    let _ = tx.execute("DELETE FROM peaks WHERE file_path = ?1", [&file_path]);
+                    let _ = tx.execute("DELETE FROM tracks WHERE file_path = ?1", [&file_path]);
                 }
             }
+            tx.commit().map_err(|e| e.to_string())?;
         }
     }
 
@@ -498,6 +711,61 @@ async fn rescan_library(
 }
 
 #[tauri::command]
+fn get_launch_files(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mut guard = state.pending_files.lock().map_err(|e| e.to_string())?;
+    Ok(std::mem::take(&mut *guard))
+}
+
+#[tauri::command]
+async fn import_files(
+    paths: Vec<String>,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TrackMetadata>, String> {
+    let candidates: Vec<String> = paths
+        .into_iter()
+        .filter(|p| {
+            let path = std::path::Path::new(p);
+            path.is_file() && scanner::is_supported_audio(path)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    for path in &candidates {
+        let _ = app_handle.asset_protocol_scope().allow_file(path);
+        let _ = app_handle.fs_scope().allow_file(path);
+    }
+
+    let imported = tokio::task::spawn_blocking(move || {
+        candidates
+            .iter()
+            .filter_map(|p| scanner::read_metadata(std::path::Path::new(p)))
+            .collect::<Vec<TrackMetadata>>()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut guard = state.db.lock().map_err(|e| e.to_string())?;
+    if let Some(conn) = guard.as_mut() {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for track in &imported {
+            let _ = tx.execute(UPSERT_TRACK_SQL, (
+                &track.file_path,
+                &track.title,
+                &track.artist,
+                &track.album,
+                &track.duration_secs,
+            ));
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+
+    Ok(imported)
+}
+
+#[tauri::command]
 fn reset_library(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("db not initialised")?;
@@ -506,12 +774,25 @@ fn reset_library(state: tauri::State<'_, AppState>) -> Result<(), String> {
     conn.execute("DELETE FROM peaks", []).map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM playlist_tracks", []).map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM playlists", []).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM art_cache", []).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            // A second launch (e.g. double-clicking a song in Explorer) forwards
+            // its arguments here and exits; play the files in this instance.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+            let files = audio_files_from_args(argv.iter(), Some(Path::new(&cwd)));
+            allow_audio_files(app, &files);
+            queue_audio_files(app, files);
+        }))
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -528,7 +809,16 @@ pub fn run() {
                     }
                 }
             }
-            app.manage(AppState { db: Mutex::new(Some(db)) });
+            // Audio files passed on first launch (Explorer "open with" / default app)
+            let args: Vec<String> = std::env::args().collect();
+            let cwd = std::env::current_dir().ok();
+            let initial_files = audio_files_from_args(args.iter(), cwd.as_deref());
+            allow_audio_files(app.handle(), &initial_files);
+
+            app.manage(AppState {
+                db: Mutex::new(Some(db)),
+                pending_files: Mutex::new(initial_files),
+            });
 
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -540,10 +830,10 @@ pub fn run() {
                     let file_path_to_process = {
                         if let Ok(guard) = state.db.lock() {
                             if let Some(conn) = guard.as_ref() {
-                                // Find a track with no title and where we haven't attempted a fetch in the last hour,
-                                // or haven't attempted at all.
+                                // Find a track missing any metadata field where we haven't
+                                // attempted a fetch in the last hour, or haven't attempted at all.
                                 let stmt = conn.prepare(
-                                    "SELECT file_path FROM tracks WHERE title IS NULL AND (strftime('%s','now') - last_metadata_fetch_attempt > 3600) LIMIT 1"
+                                    "SELECT file_path FROM tracks WHERE (title IS NULL OR artist IS NULL OR album IS NULL) AND (strftime('%s','now') - last_metadata_fetch_attempt > 3600) LIMIT 1"
                                 );
                                 if let Ok(mut stmt) = stmt {
                                     if let Ok(row) = stmt.query_row([], |row| row.get::<_, String>(0)) {
@@ -598,7 +888,6 @@ pub fn run() {
             scan_folder,
             get_waveform_peaks,
             get_track_art,
-            get_fallback_art,
             get_track_preview_art,
             get_library,
             get_folders,
@@ -607,9 +896,14 @@ pub fn run() {
             create_playlist_from_tracks,
             add_tracks_to_playlist,
             get_playlist_tracks,
+            rename_playlist,
+            delete_playlist,
+            set_playlist_order,
             remove_track_from_playlist,
             rescan_library,
-            reset_library
+            reset_library,
+            get_launch_files,
+            import_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
